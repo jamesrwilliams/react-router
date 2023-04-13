@@ -438,8 +438,8 @@ type SubmissionNavigateOptions = BaseNavigateOptions & {
   formMethod?: HTMLFormMethod;
   formEncType?: FormEncType;
 } & (
-    | { formData: FormData; payload: undefined }
-    | { formData: undefined; payload: any }
+    | { formData: FormData; payload?: undefined }
+    | { formData?: undefined; payload: any }
   );
 
 /**
@@ -485,8 +485,8 @@ export type NavigationStates = {
     formAction: string;
     formEncType: FormEncType;
   } & (
-    | { formData: FormData; payload: undefined }
-    | { formData: undefined; payload: NonNullable<unknown> | null }
+    | { formData: FormData; payload?: undefined }
+    | { formData?: undefined; payload: NonNullable<unknown> | null }
   );
 };
 
@@ -526,8 +526,8 @@ type FetcherStates<TData = any> = {
     data: TData | undefined;
     " _hasFetcherDoneAnything "?: boolean;
   } & (
-    | { formData: FormData; payload: undefined }
-    | { formData: undefined; payload: NonNullable<unknown> | null }
+    | { formData: FormData; payload?: undefined }
+    | { formData?: undefined; payload: NonNullable<unknown> | null }
   );
 };
 
@@ -1291,6 +1291,7 @@ export function createRouter(init: RouterInit): Router {
       let navigation: NavigationStates["Loading"] = {
         state: "loading",
         location,
+        ...EMPTY_SUBMISSION,
         ...opts.submission,
       };
       loadingNavigation = navigation;
@@ -1454,7 +1455,7 @@ export function createRouter(init: RouterInit): Router {
         ? submission || fetcherSubmission
         : loadingNavigation.formMethod &&
           loadingNavigation.formAction &&
-          loadingNavigation.formEncType !== undefined
+          loadingNavigation.formEncType != null
         ? {
             formMethod: loadingNavigation.formMethod,
             formAction: loadingNavigation.formAction,
@@ -1750,6 +1751,7 @@ export function createRouter(init: RouterInit): Router {
       fetchRedirectIds.add(key);
       let loadingFetcher: FetcherStates["Loading"] = {
         state: "loading",
+        ...EMPTY_SUBMISSION,
         ...submission,
         data: undefined,
         " _hasFetcherDoneAnything ": true,
@@ -1796,6 +1798,7 @@ export function createRouter(init: RouterInit): Router {
     let loadFetcher: FetcherStates["Loading"] = {
       state: "loading",
       data: actionResult.data,
+      ...EMPTY_SUBMISSION,
       ...submission,
       " _hasFetcherDoneAnything ": true,
     };
@@ -2110,7 +2113,7 @@ export function createRouter(init: RouterInit): Router {
       formMethod &&
       formAction &&
       (formData || payload) &&
-      formEncType !== undefined
+      formEncType != null
     ) {
       submission = {
         formMethod,
@@ -3153,8 +3156,11 @@ function normalizeNavigateOptions(
     };
   }
 
-  // Can't submit both
-  if (opts.formData != null && opts.payload !== undefined) {
+  // formData/payload are mutually exclusive
+  if (
+    (opts.formData == null && opts.payload === undefined) ||
+    (opts.formData != null && opts.payload !== undefined)
+  ) {
     return {
       path,
       error: getInternalRouterError(400, { type: "formData-payload" }),
@@ -3168,9 +3174,13 @@ function normalizeNavigateOptions(
     ? (rawFormMethod.toUpperCase() as V7_FormMethod)
     : (rawFormMethod.toLowerCase() as FormMethod);
   let formAction = stripHashFromPath(path);
+  let formData: FormData;
 
   // User opted-out of serialization, so just pass along the payload directly
   if (opts.payload !== undefined) {
+    // Any payload encType's besides these pass through as a normal payload and
+    // get serialized in createClientSideRequest since they are not represented
+    // via formData
     submission = {
       formMethod,
       formAction,
@@ -3180,14 +3190,9 @@ function normalizeNavigateOptions(
     };
 
     return { path, submission };
-  }
-
-  if (opts.formData == null) {
-    // But must submit one or the other
-    return {
-      path,
-      error: getInternalRouterError(400, { type: "formData-payload" }),
-    };
+  } else {
+    // We know this exists due to the mutually exclusive check above
+    formData = opts.formData!;
   }
 
   submission = {
@@ -3195,7 +3200,7 @@ function normalizeNavigateOptions(
     formAction,
     formEncType:
       (opts && opts.formEncType) || "application/x-www-form-urlencoded",
-    formData: opts.formData,
+    formData,
     payload: undefined,
   };
 
@@ -3205,7 +3210,7 @@ function normalizeNavigateOptions(
 
   // Flatten submission onto URLSearchParams for GET submissions
   let parsedPath = parsePath(path);
-  let searchParams = convertFormDataToSearchParams(opts.formData);
+  let searchParams = convertFormDataToSearchParams(formData);
   // On GET navigation submissions we can drop the ?index param from the
   // resulting location since all loaders will run.  But fetcher GET submissions
   // only run a single loader so we need to preserve any incoming ?index params
@@ -3706,23 +3711,51 @@ function createClientSideRequest(
   let url = history.createURL(stripHashFromPath(location)).toString();
   let init: RequestInit = { signal };
 
-  if (
-    submission &&
-    isMutationMethod(submission.formMethod) &&
-    submission.formData
-  ) {
-    let { formMethod, formEncType, formData } = submission;
+  if (submission && isMutationMethod(submission.formMethod)) {
+    let { formMethod, formEncType, formData, payload } = submission;
     // Didn't think we needed this but it turns out unlike other methods, patch
     // won't be properly normalized to uppercase and results in a 405 error.
     // See: https://fetch.spec.whatwg.org/#concept-method
     init.method = formMethod.toUpperCase();
-    init.body =
-      formEncType === "application/x-www-form-urlencoded"
-        ? convertFormDataToSearchParams(formData)
-        : formData;
+
+    if (formData) {
+      if (formEncType === "application/x-www-form-urlencoded") {
+        // Content-Type is inferred (https://fetch.spec.whatwg.org/#dom-request)
+        init.body = convertFormDataToSearchParams(formData);
+      } else {
+        // Content-Type is inferred (https://fetch.spec.whatwg.org/#dom-request)
+        init.body = formData;
+      }
+    } else if (payload != null) {
+      if (formEncType === "application/x-www-form-urlencoded") {
+        let payloadFormData = new FormData();
+
+        if (payload instanceof URLSearchParams) {
+          for (let [name, value] of payload) {
+            payloadFormData.append(name, value);
+          }
+        } else if (payload != null) {
+          for (let name of Object.keys(payload)) {
+            // @ts-expect-error
+            payloadFormData.append(name, payload[name]);
+          }
+        }
+
+        // Content-Type is inferred (https://fetch.spec.whatwg.org/#dom-request)
+        init.body = convertFormDataToSearchParams(payloadFormData);
+      } else if (formEncType === "application/json") {
+        init.headers = new Headers({ "Content-Type": formEncType });
+        init.body = JSON.stringify(payload);
+      } else if (formEncType === "text/plain") {
+        init.headers = new Headers({
+          "Content-Type": formEncType,
+        });
+        init.body =
+          typeof payload === "string" ? payload : JSON.stringify(payload);
+      }
+    }
   }
 
-  // Content-Type is inferred (https://fetch.spec.whatwg.org/#dom-request)
   return new Request(url, init);
 }
 
